@@ -194,6 +194,35 @@ describe("requeueStuck", () => {
     expect((await job("1001")).attempts).toBe(config.maxAttempts);
   });
 
+  // a worker can ship an order and die before marking the job done. the sweep
+  // then parks that job, and must not undo the shipment.
+  it("leaves an order that already shipped alone when the sweep parks its job", async () => {
+    await givenQueuedOrder("1001");
+    const claimed = await claim();
+    await makeShipmentHandler(working)(claimed!);
+
+    const shipped = await sequelize.query<{ status: string; shipment_id: string }>(
+      `SELECT status, shipment_id FROM orders WHERE order_id = '1001'`,
+      { type: QueryTypes.SELECT }
+    );
+    expect(shipped[0]).toEqual({ status: "shipped", shipment_id: "SHIP-1" });
+
+    // use up its attempts and abandon it, so the sweep parks it
+    await sequelize.query(`UPDATE jobs SET attempts = $a WHERE order_id = '1001'`, {
+      bind: { a: config.maxAttempts },
+      type: QueryTypes.UPDATE,
+    });
+    await abandon("1001", 120);
+    await sweepStuck();
+
+    expect((await job("1001")).status).toBe("dead");
+    const after = await sequelize.query<{ status: string; shipment_id: string }>(
+      `SELECT status, shipment_id FROM orders WHERE order_id = '1001'`,
+      { type: QueryTypes.SELECT }
+    );
+    expect(after[0]).toEqual({ status: "shipped", shipment_id: "SHIP-1" });
+  });
+
   it("the parked order is marked failed when the worker sweeps", async () => {
     await givenQueuedOrder("1001");
     for (let i = 0; i < config.maxAttempts; i++) {

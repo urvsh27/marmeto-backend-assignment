@@ -10,7 +10,19 @@ export type ClaimedJob = {
   attempts: number;
   runAt: Date;
   lastError: string | null;
+  // proof of ownership, passed back when finishing the job
+  lockedAt: Date;
 };
+
+// Only the worker still holding a job may change it. A worker that stalls long
+// enough for the sweep to requeue its job, while another worker picks it up and
+// finishes it, must not then be able to overwrite that result.
+//
+// date_trunc is not decoration: Postgres stores timestamptz to the microsecond
+// and the pg driver hands it back as a JS Date, which only has milliseconds. A
+// plain `locked_at = $lockedAt` matches nothing at all.
+const STILL_OURS = `status = 'processing'
+                    AND date_trunc('milliseconds', locked_at) = $lockedAt`;
 
 // lives here rather than in the worker so src/shipping can refer to it without
 // importing the worker back
@@ -23,6 +35,7 @@ type JobRow = {
   attempts: number;
   run_at: Date;
   last_error: string | null;
+  locked_at: Date;
 };
 
 // Every read and write of the jobs table lives in this file. Swapping the
@@ -80,7 +93,7 @@ export async function claim(): Promise<ClaimedJob | null> {
              LIMIT 1
              FOR UPDATE SKIP LOCKED
       )
-      RETURNING id, order_id, type, attempts, run_at, last_error`,
+      RETURNING id, order_id, type, attempts, run_at, last_error, locked_at`,
     { type: QueryTypes.SELECT }
   );
 
@@ -94,16 +107,21 @@ export async function claim(): Promise<ClaimedJob | null> {
     attempts: row.attempts,
     runAt: row.run_at,
     lastError: row.last_error,
+    lockedAt: row.locked_at,
   };
 }
 
-export async function complete(jobId: string): Promise<void> {
-  await sequelize.query(
+// Returns false when the job was taken away from us, so the caller can say so
+// rather than assuming it worked.
+export async function complete(jobId: string, lockedAt: Date): Promise<boolean> {
+  const rows = await sequelize.query<{ id: string }>(
     `UPDATE jobs
         SET status = 'done', locked_at = NULL, last_error = NULL, updated_at = now()
-      WHERE id = $jobId`,
-    { bind: { jobId }, type: QueryTypes.UPDATE }
+      WHERE id = $jobId AND ${STILL_OURS}
+      RETURNING id`,
+    { bind: { jobId, lockedAt }, type: QueryTypes.SELECT }
   );
+  return rows.length > 0;
 }
 
 export type SweepResult = {
@@ -270,36 +288,42 @@ export type FailureKind = "rejected" | "exhausted";
 
 export async function markDead(
   jobId: string,
+  lockedAt: Date,
   lastError: string,
   failureKind: FailureKind
-): Promise<void> {
-  await sequelize.query(
+): Promise<boolean> {
+  const rows = await sequelize.query<{ id: string }>(
     `UPDATE jobs
         SET status = 'dead',
             locked_at = NULL,
             last_error = $lastError,
             failure_kind = $failureKind,
             updated_at = now()
-      WHERE id = $jobId`,
-    { bind: { jobId, lastError, failureKind }, type: QueryTypes.UPDATE }
+      WHERE id = $jobId AND ${STILL_OURS}
+      RETURNING id`,
+    { bind: { jobId, lockedAt, lastError, failureKind }, type: QueryTypes.SELECT }
   );
+  return rows.length > 0;
 }
 
 // Back to pending, to be picked up again once run_at passes. The caller decides
 // the delay: Retry-After when the courier sent one, otherwise jittered backoff.
 export async function retryLater(
   jobId: string,
+  lockedAt: Date,
   delaySeconds: number,
   lastError: string
-): Promise<void> {
-  await sequelize.query(
+): Promise<boolean> {
+  const rows = await sequelize.query<{ id: string }>(
     `UPDATE jobs
         SET status = 'pending',
             locked_at = NULL,
             run_at = now() + make_interval(secs => $delaySeconds),
             last_error = $lastError,
             updated_at = now()
-      WHERE id = $jobId`,
-    { bind: { jobId, delaySeconds, lastError }, type: QueryTypes.UPDATE }
+      WHERE id = $jobId AND ${STILL_OURS}
+      RETURNING id`,
+    { bind: { jobId, lockedAt, delaySeconds, lastError }, type: QueryTypes.SELECT }
   );
+  return rows.length > 0;
 }

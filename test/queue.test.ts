@@ -1,7 +1,8 @@
 import { QueryTypes } from "sequelize";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { config } from "../src/config";
 import { sequelize } from "../src/db";
-import { claim, enqueue } from "../src/queue/jobs";
+import { claim, complete, enqueue, markDead, requeueStuck, retryLater } from "../src/queue/jobs";
 
 // a job needs an order to point at, the FK says so
 async function givenOrder(orderId: string) {
@@ -125,6 +126,40 @@ describe("claim", () => {
 
     // and it is claimable again once the lock is released
     expect((await claim())?.orderId).toBe("1001");
+  });
+
+  // a worker that stalls past the lock timeout, has its job requeued and taken
+  // over, then wakes up and tries to report on it
+  it("refuses updates from a worker that no longer holds the job", async () => {
+    await givenOrder("1001");
+    await enqueue("1001");
+
+    const stale = await claim();
+    await sequelize.query("UPDATE jobs SET locked_at = now() - interval '10 minutes'");
+    await requeueStuck(60, config.maxAttempts);
+    const fresh = await claim();
+
+    expect(fresh).not.toBeNull();
+    expect(await complete(stale!.id, stale!.lockedAt)).toBe(false);
+    expect(await retryLater(stale!.id, stale!.lockedAt, 5, "stale")).toBe(false);
+    expect(await markDead(stale!.id, stale!.lockedAt, "stale", "exhausted")).toBe(false);
+
+    // the job is untouched and still belongs to the worker that holds it
+    expect((await jobStatus("1001")).status).toBe("processing");
+
+    // and that worker can still finish it
+    expect(await complete(fresh!.id, fresh!.lockedAt)).toBe(true);
+    expect((await jobStatus("1001")).status).toBe("done");
+  });
+
+  it("lets the holder finish, and only once", async () => {
+    await givenOrder("1001");
+    await enqueue("1001");
+    const job = await claim();
+
+    expect(await complete(job!.id, job!.lockedAt)).toBe(true);
+    // the lock is gone now, so the same call cannot land twice
+    expect(await complete(job!.id, job!.lockedAt)).toBe(false);
   });
 
   it("gives two workers one job each when two are waiting", async () => {

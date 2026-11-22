@@ -4,6 +4,7 @@ import { Courier } from "../courier/client";
 import { Order, OrderStatus } from "../db/models";
 import { activeOrderIds, completeFor, rejectedOrderIds, reset } from "../queue/jobs";
 import { markShipped } from "./createShipment";
+import { recoverStuckJobs } from "./recoverStuck";
 
 export type ReconcileReport = {
   checked: number;
@@ -26,6 +27,11 @@ export async function reconcile(
   courier: Courier,
   olderThanMinutes: number = config.reconcileAfterMinutes
 ): Promise<ReconcileReport> {
+  // First, recover anything a dead worker left in processing. Without this those
+  // jobs look like they are in flight and get skipped below, which means nothing
+  // ever picks them up when no worker is running.
+  await recoverStuckJobs();
+
   const cutoff = new Date(Date.now() - olderThanMinutes * 60_000);
 
   const stale = await Order.findAll({

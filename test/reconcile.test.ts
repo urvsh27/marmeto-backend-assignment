@@ -1,6 +1,7 @@
 import { QueryTypes } from "sequelize";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { Courier, Shipment } from "../src/courier/client";
+import { config } from "../src/config";
 import { sequelize } from "../src/db";
 import { claim, enqueue } from "../src/queue/jobs";
 import { reconcile } from "../src/shipping/reconcile";
@@ -53,6 +54,14 @@ async function job(orderId: string) {
     { bind: { orderId }, type: QueryTypes.SELECT }
   );
   return row;
+}
+
+// pretend the worker that claimed this died: the lock is older than the timeout
+async function abandonLock(orderId: string) {
+  await sequelize.query(
+    `UPDATE jobs SET locked_at = now() - make_interval(secs => $secs) WHERE order_id = $orderId`,
+    { bind: { orderId, secs: config.jobLockTimeoutSeconds + 60 }, type: QueryTypes.UPDATE }
+  );
 }
 
 async function park(orderId: string, failureKind: "exhausted" | "rejected" = "exhausted") {
@@ -147,6 +156,40 @@ describe("reconcile", () => {
 
     expect(report.skippedInFlight).toBe(1);
     expect(report.checked).toBe(0);
+  });
+
+  // reconcile sweeps before it looks at anything. without that, a job a dead
+  // worker left in processing looks like work in flight and gets skipped for
+  // ever, because nothing else is running to recover it.
+  it("recovers a job a dead worker abandoned, so a worker can pick it up again", async () => {
+    await givenOrder("1001");
+    await claim();
+    await abandonLock("1001");
+
+    const report = await reconcile(lookupOnlyCourier(), 10);
+
+    // the sweep put it back, which is why it then counts as in flight
+    expect((await job("1001")).status).toBe("pending");
+    expect((await job("1001")).attempts).toBe(1);
+    expect(report.skippedInFlight).toBe(1);
+  });
+
+  it("records the shipment when the abandoned job also had no attempts left", async () => {
+    await givenOrder("1001");
+    await claim();
+    await sequelize.query(`UPDATE jobs SET attempts = $attempts WHERE order_id = '1001'`, {
+      bind: { attempts: config.maxAttempts },
+      type: QueryTypes.UPDATE,
+    });
+    await abandonLock("1001");
+    const courier = lookupOnlyCourier([{ shipmentId: "SHIP-ORPHAN", reference: "1001" }]);
+
+    const report = await reconcile(courier, 10);
+
+    // the sweep parked it, so reconcile could then look it up and record it
+    expect(report.recorded).toEqual(["1001 -> SHIP-ORPHAN"]);
+    expect(await order("1001")).toEqual({ status: "shipped", shipment_id: "SHIP-ORPHAN" });
+    expect((await job("1001")).status).toBe("done");
   });
 
   it("skips an order a worker is processing right now", async () => {

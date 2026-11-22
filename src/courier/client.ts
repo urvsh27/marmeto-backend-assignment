@@ -76,9 +76,16 @@ export function createCourierClient(
   const baseUrl = (opts.baseUrl ?? config.courierBaseUrl).replace(/\/$/, "");
   const timeoutMs = opts.timeoutMs ?? config.courierTimeoutMs;
 
+  type Answer = { status: number; ok: boolean; retryAfter: string | null; body: unknown };
+
   // Own AbortController rather than AbortSignal.timeout, so a timeout can be
   // told apart from any other abort instead of guessing from the error name.
-  async function send(path: string, init: RequestInit = {}): Promise<Response> {
+  //
+  // The body is read here, while the timer is still running. fetch resolves as
+  // soon as the headers arrive, so reading the body outside this function would
+  // leave a courier that sends headers and then stalls mid-body hanging for
+  // ever, with nothing left to abort it.
+  async function send(path: string, init: RequestInit = {}): Promise<Answer> {
     const controller = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -87,7 +94,25 @@ export function createCourierClient(
     }, timeoutMs);
 
     try {
-      return await fetch(`${baseUrl}${path}`, { ...init, signal: controller.signal });
+      const res = await fetch(`${baseUrl}${path}`, { ...init, signal: controller.signal });
+      const text = await res.text();
+
+      let body: unknown = null;
+      if (text.length > 0) {
+        try {
+          body = JSON.parse(text);
+        } catch {
+          // an error page rather than json. the status is what matters.
+          body = null;
+        }
+      }
+
+      return {
+        status: res.status,
+        ok: res.ok,
+        retryAfter: res.headers.get("retry-after"),
+        body,
+      };
     } catch (err) {
       if (timedOut) {
         throw new CourierError("timeout", `courier did not answer within ${timeoutMs}ms`);
@@ -109,11 +134,11 @@ export function createCourierClient(
       if (!res.ok) {
         throw new CourierError(failureFor(res.status), `create shipment failed with ${res.status}`, {
           status: res.status,
-          retryAfterSeconds: parseRetryAfter(res.headers.get("retry-after")),
+          retryAfterSeconds: parseRetryAfter(res.retryAfter),
         });
       }
 
-      const body = (await res.json()) as Partial<Shipment>;
+      const body = (res.body ?? {}) as Partial<Shipment>;
       if (!body.shipmentId) {
         // a 201 with nothing useful in it. not worth retrying blindly.
         throw new CourierError("rejected", "courier returned no shipmentId", { status: res.status });
@@ -128,11 +153,11 @@ export function createCourierClient(
       if (!res.ok) {
         throw new CourierError(failureFor(res.status), `lookup failed with ${res.status}`, {
           status: res.status,
-          retryAfterSeconds: parseRetryAfter(res.headers.get("retry-after")),
+          retryAfterSeconds: parseRetryAfter(res.retryAfter),
         });
       }
 
-      const body = (await res.json()) as { shipments?: Shipment[] };
+      const body = (res.body ?? {}) as { shipments?: Shipment[] };
       // oldest first, so picking "the earliest" is the same answer every time
       return (body.shipments ?? [])
         .slice()

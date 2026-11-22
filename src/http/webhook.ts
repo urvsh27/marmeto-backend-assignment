@@ -41,8 +41,23 @@ async function intake(
       { bind: { webhookId, orderId, payload: json }, transaction, type: QueryTypes.SELECT }
     );
 
-    // the exact same delivery again. nothing else to do.
-    if (events.length === 0) return { duplicate: true };
+    if (events.length === 0) {
+      // the id is already on record. if it was for this same order it is simply
+      // the same delivery arriving twice, which is the common case.
+      const [seen] = await sequelize.query<{ order_id: string }>(
+        `SELECT order_id FROM webhook_events WHERE webhook_id = $webhookId`,
+        { bind: { webhookId }, transaction, type: QueryTypes.SELECT }
+      );
+
+      if (!seen || seen.order_id === orderId) return { duplicate: true };
+
+      // the store reused a delivery id for a different order. treating that as a
+      // duplicate would silently drop a real order, which is far worse than a
+      // missing audit row, so carry on and store the order.
+      console.warn(
+        `webhook id ${webhookId} was already used for order ${seen.order_id}, now sent for ${orderId}. storing the order anyway`
+      );
+    }
 
     const orders = await sequelize.query<{ order_id: string }>(
       `INSERT INTO orders (order_id, payload)

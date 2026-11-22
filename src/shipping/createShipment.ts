@@ -1,6 +1,8 @@
-import { Courier } from "../courier/client";
+import { Op } from "sequelize";
+import { config } from "../config";
+import { Courier, CourierError, Shipment } from "../courier/client";
 import { Order, OrderStatus } from "../db/models";
-import { JobHandler } from "../queue/jobs";
+import { ClaimedJob, JobHandler } from "../queue/jobs";
 
 // Order state lives here. Job state lives in src/queue/jobs.ts. The worker only
 // decides which to call.
@@ -8,8 +10,14 @@ export async function markShipped(orderId: string, shipmentId: string): Promise<
   await Order.update({ status: OrderStatus.shipped, shipmentId }, { where: { orderId } });
 }
 
+// Never touches a shipped order. A worker can ship an order and then be killed
+// before it marks the job done, and the sweep would otherwise park that job and
+// overwrite a real shipment with "failed".
 export async function markOrderFailed(orderId: string): Promise<void> {
-  await Order.update({ status: OrderStatus.failed }, { where: { orderId } });
+  await Order.update(
+    { status: OrderStatus.failed },
+    { where: { orderId, status: { [Op.ne]: OrderStatus.shipped } } }
+  );
 }
 
 // Back to the starting state so a replayed job is handled normally. Only touches
@@ -19,6 +27,30 @@ export async function markOrderForRetry(orderId: string): Promise<void> {
     { status: OrderStatus.received },
     { where: { orderId, status: OrderStatus.failed } }
   );
+}
+
+// Only on the final attempt, and only when the failure could have left a
+// shipment behind. A 4xx means the courier never accepted the request, so there
+// is nothing to find; a timeout or a 5xx means there might well be.
+async function lastChanceLookup(
+  courier: Courier,
+  job: ClaimedJob,
+  err: unknown
+): Promise<boolean> {
+  const isLastAttempt = job.attempts >= config.maxAttempts;
+  const couldHaveLanded =
+    err instanceof CourierError && (err.kind === "timeout" || err.kind === "unavailable");
+
+  if (!isLastAttempt || !couldHaveLanded) return false;
+
+  const found = await courier.findShipments(job.orderId);
+  if (found.length === 0) return false;
+
+  console.warn(
+    `order ${job.orderId} failed on its last attempt but the courier had ${found[0].shipmentId}, recording it`
+  );
+  await markShipped(job.orderId, found[0].shipmentId);
+  return true;
 }
 
 // The courier is not idempotent and it sometimes creates a shipment and then
@@ -53,11 +85,22 @@ export function makeShipmentHandler(courier: Courier): JobHandler {
     }
 
     const payload = order.payload as Record<string, unknown>;
-    const shipment = await courier.createShipment({
-      reference: job.orderId,
-      address: payload.shipping_address ?? null,
-      items: payload.line_items ?? [],
-    });
+
+    let shipment: Shipment;
+    try {
+      shipment = await courier.createShipment({
+        reference: job.orderId,
+        address: payload.shipping_address ?? null,
+        items: payload.line_items ?? [],
+      });
+    } catch (err) {
+      // On the last attempt, look once more before letting this job die. A
+      // timeout is exactly the case where the shipment probably does exist, and
+      // without this the order sits as failed until reconcile runs minutes later.
+      const salvaged = await lastChanceLookup(courier, job, err);
+      if (salvaged) return;
+      throw err;
+    }
 
     console.log(`order ${job.orderId} shipped as ${shipment.shipmentId}`);
     await markShipped(job.orderId, shipment.shipmentId);

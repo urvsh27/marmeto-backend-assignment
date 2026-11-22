@@ -100,6 +100,45 @@ describe("createShipment", () => {
     expect(err.retryable).toBe(false);
   });
 
+  // fetch resolves when the headers arrive, so this is the case where the
+  // timeout has to still be running while the body is read
+  it("times out when the headers arrive but the body stalls", async () => {
+    handler = (_req, res) => {
+      res.writeHead(201, { "content-type": "application/json" });
+      res.write("{");
+      // and then never finishes
+    };
+
+    const started = Date.now();
+    const err = await failure(client().createShipment(input));
+
+    expect(err.kind).toBe("timeout");
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it("times out when the lookup body stalls too", async () => {
+    handler = (_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write('{"shipments":');
+    };
+
+    const err = await failure(client().findShipments("ORD-1"));
+
+    expect(err.kind).toBe("timeout");
+  });
+
+  it("treats a non-json error body as the status it came with", async () => {
+    handler = (_req, res) => {
+      res.writeHead(500, { "content-type": "text/html" });
+      res.end("<html>courier is down</html>");
+    };
+
+    const err = await failure(client().createShipment(input));
+
+    expect(err.kind).toBe("unavailable");
+    expect(err.status).toBe(500);
+  });
+
   it("times out instead of waiting for a hanging courier", async () => {
     // never responds, like the mock's 10s hang
     handler = () => {};

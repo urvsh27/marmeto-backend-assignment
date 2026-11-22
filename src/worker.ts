@@ -3,16 +3,17 @@ import { CourierError, createCourierClient } from "./courier/client";
 import { sequelize } from "./db";
 import { backoffSeconds } from "./lib/backoff";
 import {
+  ClaimedJob,
   FailureKind,
   JobHandler,
   SweepResult,
   claim,
   complete,
   markDead,
-  requeueStuck,
   retryLater,
 } from "./queue/jobs";
 import { makeShipmentHandler, markOrderFailed } from "./shipping/createShipment";
+import { recoverStuckJobs } from "./shipping/recoverStuck";
 
 // docker sends SIGKILL ten seconds after SIGTERM, so give up before that
 const SHUTDOWN_TIMEOUT_MS = 8000;
@@ -60,6 +61,15 @@ function decide(err: unknown, attempts: number): Decision {
   return { dead: false, delaySeconds: backoffSeconds(attempts) };
 }
 
+// The job was requeued under us while we were working on it, which means this
+// worker stalled for longer than the lock timeout. Another worker owns it now,
+// so say so loudly and change nothing.
+function lostIt(job: ClaimedJob) {
+  console.warn(
+    `job ${job.id} order ${job.orderId} was taken over by another worker while we were on it, leaving it alone`
+  );
+}
+
 // One claim-and-handle cycle, separate from the loop so tests can drive it with
 // their own handler and no timers.
 export async function runOnce(handler: JobHandler = shipWithRealCourier): Promise<Outcome> {
@@ -68,7 +78,8 @@ export async function runOnce(handler: JobHandler = shipWithRealCourier): Promis
 
   try {
     await handler(job);
-    await complete(job.id);
+    const kept = await complete(job.id, job.lockedAt);
+    if (!kept) lostIt(job);
     return "done";
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -78,7 +89,11 @@ export async function runOnce(handler: JobHandler = shipWithRealCourier): Promis
       console.error(
         `job ${job.id} order ${job.orderId} parked as dead, ${decision.reason}: ${message}`
       );
-      await markDead(job.id, message, decision.kind);
+      const kept = await markDead(job.id, job.lockedAt, message, decision.kind);
+      if (!kept) {
+        lostIt(job);
+        return "dead";
+      }
       await markOrderFailed(job.orderId);
       return "dead";
     }
@@ -86,32 +101,16 @@ export async function runOnce(handler: JobHandler = shipWithRealCourier): Promis
     console.warn(
       `job ${job.id} order ${job.orderId} attempt ${job.attempts} failed, retrying in ${decision.delaySeconds}s: ${message}`
     );
-    await retryLater(job.id, decision.delaySeconds, message);
+    const kept = await retryLater(job.id, job.lockedAt, decision.delaySeconds, message);
+    if (!kept) lostIt(job);
     return "retrying";
   }
 }
 
-// Recovers jobs left behind by a worker that died. Anything with no attempts
-// left is parked instead of requeued, otherwise a job that kills the worker
-// every time would go round forever without ever reaching dead. Exported so it
-// can be tested without running the loop.
+// Kept as a name the worker and its tests use. The work itself lives in
+// src/shipping/recoverStuck.ts because the reconcile script needs it too.
 export async function sweepStuck(): Promise<SweepResult> {
-  const result = await requeueStuck(config.jobLockTimeoutSeconds, config.maxAttempts);
-
-  if (result.requeued.length > 0) {
-    console.warn(`requeued ${result.requeued.length} stuck job(s): ${result.requeued.join(", ")}`);
-  }
-
-  for (const orderId of result.parked) {
-    await markOrderFailed(orderId);
-  }
-  if (result.parked.length > 0) {
-    console.error(
-      `parked ${result.parked.length} stuck job(s) with no attempts left: ${result.parked.join(", ")}`
-    );
-  }
-
-  return result;
+  return recoverStuckJobs();
 }
 
 function sleep(ms: number) {

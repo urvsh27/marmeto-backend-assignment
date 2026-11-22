@@ -1,6 +1,7 @@
 import { QueryTypes } from "sequelize";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { Courier, CourierError, CreateShipmentInput, Shipment } from "../src/courier/client";
+import { config } from "../src/config";
 import { sequelize } from "../src/db";
 import { enqueue } from "../src/queue/jobs";
 import { makeShipmentHandler } from "../src/shipping/createShipment";
@@ -124,6 +125,74 @@ describe("check then create", () => {
 
     expect(courier.created).toHaveLength(0);
     expect((await order("1001")).shipment_id).toBe("SHIP-OLD");
+  });
+});
+
+// The final attempt is the only one where a failure means the job dies, so it is
+// the only place the extra lookup matters. Everything above here is attempt 1,
+// which retries and finds the shipment on the way back round.
+describe("the last attempt", () => {
+  async function atTheLimit(orderId: string) {
+    await givenQueuedOrder(orderId);
+    await sequelize.query(`UPDATE jobs SET attempts = $attempts WHERE order_id = $orderId`, {
+      bind: { attempts: config.maxAttempts - 1, orderId },
+      type: QueryTypes.UPDATE,
+    });
+  }
+
+  it("records a shipment the courier made, instead of dying with it lost", async () => {
+    await atTheLimit("1001");
+
+    const made: Shipment[] = [];
+    let createCalls = 0;
+    const createsThenTimesOut: Courier = {
+      async findShipments() {
+        return made;
+      },
+      async createShipment(input) {
+        createCalls += 1;
+        // the courier really does create it, then goes quiet
+        made.push({ shipmentId: "SHIP-LATE", reference: input.reference });
+        throw new CourierError("timeout", "courier did not answer within 5000ms");
+      },
+    };
+
+    expect(await runOnce(makeShipmentHandler(createsThenTimesOut))).toBe("done");
+
+    expect(createCalls).toBe(1);
+    expect(await order("1001")).toEqual({ status: "shipped", shipment_id: "SHIP-LATE" });
+    expect((await job("1001")).status).toBe("done");
+  });
+
+  it("still dies when the courier really has nothing", async () => {
+    await atTheLimit("1001");
+    const courier = fakeCourier({
+      onCreate: () => {
+        throw new CourierError("timeout", "courier did not answer within 5000ms");
+      },
+    });
+
+    expect(await runOnce(makeShipmentHandler(courier))).toBe("dead");
+    expect((await order("1001")).status).toBe("failed");
+  });
+
+  it("does not look again after a 4xx, because nothing can have been created", async () => {
+    await atTheLimit("1001");
+
+    let lookups = 0;
+    const refuses: Courier = {
+      async findShipments() {
+        lookups += 1;
+        return [];
+      },
+      async createShipment() {
+        throw new CourierError("rejected", "reference is required", { status: 400 });
+      },
+    };
+
+    expect(await runOnce(makeShipmentHandler(refuses))).toBe("dead");
+    // only the lookup that runs before every create, not a second one
+    expect(lookups).toBe(1);
   });
 });
 
