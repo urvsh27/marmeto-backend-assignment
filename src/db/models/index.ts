@@ -1,9 +1,7 @@
 // importing from here registers all three models on the sequelize instance
-export { Order } from "./order";
-export type { OrderStatus } from "./order";
+export { Order, OrderStatus } from "./order";
 export { WebhookEvent } from "./webhookEvent";
-export { Job } from "./job";
-export type { JobStatus } from "./job";
+export { Job, JobStatus } from "./job";
 
 import { Order } from "./order";
 import { Job } from "./job";

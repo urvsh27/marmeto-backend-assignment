@@ -1,27 +1,37 @@
 import { config } from "./config";
+import { CourierError, createCourierClient } from "./courier/client";
 import { sequelize } from "./db";
-import { ClaimedJob, claim, complete, retryLater } from "./queue/jobs";
-
-// Fixed for now. Step 13 replaces this with exponential backoff plus jitter,
-// and with Retry-After when the courier sends one.
-const RETRY_DELAY_SECONDS = 5;
+import { backoffSeconds } from "./lib/backoff";
+import { JobHandler, claim, complete, markDead, retryLater } from "./queue/jobs";
+import { makeShipmentHandler, markOrderFailed } from "./shipping/createShipment";
 
 // docker sends SIGKILL ten seconds after SIGTERM, so give up before that
 const SHUTDOWN_TIMEOUT_MS = 8000;
 
-export type JobHandler = (job: ClaimedJob) => Promise<void>;
+export type Outcome = "idle" | "done" | "retrying" | "dead";
 
-// Placeholder. Step 11 brings the courier client and step 12 the
-// check-by-reference that goes in front of it.
-const logOnly: JobHandler = async (job) => {
-  console.log(`job ${job.id} order ${job.orderId} attempt ${job.attempts}: nothing to do yet`);
-};
+const shipWithRealCourier = makeShipmentHandler(createCourierClient());
 
-export type Outcome = "idle" | "done" | "retrying";
+// How long to wait before trying this job again, and whether to bother.
+//   429        -> exactly as long as the courier asked, it knows its own limits
+//   5xx, timeout, unreachable -> jittered backoff on the attempt count
+//   other 4xx  -> our request is wrong, the same request will fail again
+function decide(err: unknown, attempts: number): { dead: boolean; delaySeconds: number } {
+  if (err instanceof CourierError) {
+    if (!err.retryable) return { dead: true, delaySeconds: 0 };
+    if (err.kind === "rate_limited" && err.retryAfterSeconds !== undefined) {
+      return { dead: false, delaySeconds: Math.max(1, err.retryAfterSeconds) };
+    }
+  }
+
+  // anything that isn't a CourierError is a bug on our side, but retrying is
+  // still safer than dropping the job: check-by-reference makes it harmless
+  return { dead: false, delaySeconds: backoffSeconds(attempts) };
+}
 
 // One claim-and-handle cycle, separate from the loop so tests can drive it with
 // their own handler and no timers.
-export async function runOnce(handler: JobHandler = logOnly): Promise<Outcome> {
+export async function runOnce(handler: JobHandler = shipWithRealCourier): Promise<Outcome> {
   const job = await claim();
   if (!job) return "idle";
 
@@ -31,8 +41,19 @@ export async function runOnce(handler: JobHandler = logOnly): Promise<Outcome> {
     return "done";
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`job ${job.id} order ${job.orderId} failed: ${message}`);
-    await retryLater(job.id, RETRY_DELAY_SECONDS, message);
+    const { dead, delaySeconds } = decide(err, job.attempts);
+
+    if (dead) {
+      console.error(`job ${job.id} order ${job.orderId} parked as dead: ${message}`);
+      await markDead(job.id, message);
+      await markOrderFailed(job.orderId);
+      return "dead";
+    }
+
+    console.warn(
+      `job ${job.id} order ${job.orderId} attempt ${job.attempts} failed, retrying in ${delaySeconds}s: ${message}`
+    );
+    await retryLater(job.id, delaySeconds, message);
     return "retrying";
   }
 }
@@ -43,7 +64,7 @@ function sleep(ms: number) {
 
 let running = true;
 
-export async function start(handler: JobHandler = logOnly): Promise<void> {
+export async function start(handler: JobHandler = shipWithRealCourier): Promise<void> {
   console.log(`worker started, polling every ${config.workerPollMs}ms`);
 
   while (running) {

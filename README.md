@@ -143,6 +143,32 @@ Several workers can run at once. The claim is a single `UPDATE ... WHERE id = (
 SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1)`, so a worker locks the row it took
 and any other worker steps over it rather than queueing behind it.
 
+Courier calls give up after `COURIER_TIMEOUT_MS` (5000 by default), which has to
+be well under the mock's 10 second hang.
+
+### Why the worker asks before it creates
+
+Every attempt calls `GET /shipments?reference=<orderId>` first, and only posts if
+nothing comes back. The courier is not idempotent, and ~10% of its calls create
+the shipment and then hang until the client gives up — so a retry after a timeout
+would create a second parcel for the same order. Asking first costs one request
+and removes that entirely.
+
+If the courier somehow holds more than one shipment for a reference, the earliest
+is kept and the rest are logged. The client sorts oldest first so the worker and
+the reconcile job always pick the same one.
+
+### What a failure does
+
+| what came back | what happens |
+| --- | --- |
+| 429 | retry at exactly `Retry-After` seconds, because the courier knows its own limits |
+| 5xx, timeout, unreachable | retry with exponential backoff and full jitter, capped at `RETRY_MAX_SECONDS` |
+| any other 4xx | no retry. The request is wrong, so the same request fails the same way. Job goes to `dead`, order to `failed` |
+
+Jitter is there because twenty workers that all got a 500 at the same moment
+would otherwise all come back at the same moment.
+
 The mock courier, in another terminal:
 
 ```bash

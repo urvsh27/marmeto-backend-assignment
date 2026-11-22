@@ -7,7 +7,14 @@ import {
 } from "sequelize";
 import { sequelize } from "../index";
 
-export type JobStatus = "pending" | "processing" | "done" | "dead";
+export const JobStatus = {
+  pending: "pending",
+  processing: "processing",
+  done: "done",
+  dead: "dead",
+} as const;
+
+export type JobStatus = (typeof JobStatus)[keyof typeof JobStatus];
 
 export class Job extends Model<InferAttributes<Job>, InferCreationAttributes<Job>> {
   // bigserial comes back as a string from pg, which is fine, we only log it

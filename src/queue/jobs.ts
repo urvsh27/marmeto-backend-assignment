@@ -12,6 +12,10 @@ export type ClaimedJob = {
   lastError: string | null;
 };
 
+// lives here rather than in the worker so src/shipping can refer to it without
+// importing the worker back
+export type JobHandler = (job: ClaimedJob) => Promise<void>;
+
 type JobRow = {
   id: string;
   order_id: string;
@@ -102,8 +106,20 @@ export async function complete(jobId: string): Promise<void> {
   );
 }
 
+// Parked. Nothing claims it again until something sets it back to pending, which
+// is what scripts/replay.ts and the reconcile job do. The error stays on the row
+// so you can see why from a query.
+export async function markDead(jobId: string, lastError: string): Promise<void> {
+  await sequelize.query(
+    `UPDATE jobs
+        SET status = 'dead', locked_at = NULL, last_error = $lastError, updated_at = now()
+      WHERE id = $jobId`,
+    { bind: { jobId, lastError }, type: QueryTypes.UPDATE }
+  );
+}
+
 // Back to pending, to be picked up again once run_at passes. The caller decides
-// the delay: a fixed one for now, backoff and Retry-After from step 13.
+// the delay: Retry-After when the courier sent one, otherwise jittered backoff.
 export async function retryLater(
   jobId: string,
   delaySeconds: number,

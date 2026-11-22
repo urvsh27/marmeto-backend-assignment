@@ -7,7 +7,15 @@ import {
 } from "sequelize";
 import { sequelize } from "../index";
 
-export type OrderStatus = "received" | "shipped" | "failed";
+// keys match the values so the constant reads the same as what the database
+// stores, and so one grep finds the code, the sql and the migration
+export const OrderStatus = {
+  received: "received",
+  shipped: "shipped",
+  failed: "failed",
+} as const;
+
+export type OrderStatus = (typeof OrderStatus)[keyof typeof OrderStatus];
 
 export class Order extends Model<InferAttributes<Order>, InferCreationAttributes<Order>> {
   declare orderId: string;
