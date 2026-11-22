@@ -1,0 +1,19 @@
+import "dotenv/config";
+
+// Read everything once at startup and fail loudly if something required is
+// missing, rather than discovering it halfway through processing a webhook.
+function required(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required env var ${name}. Copy .env.example to .env.`);
+  }
+  return value;
+}
+
+export const config = {
+  port: Number(process.env.PORT ?? 3000),
+  nodeEnv: process.env.NODE_ENV ?? "development",
+  databaseUrl: required("DATABASE_URL"),
+  webhookSecret: required("WEBHOOK_SECRET"),
+  courierBaseUrl: process.env.COURIER_BASE_URL ?? "http://localhost:4000",
+};
