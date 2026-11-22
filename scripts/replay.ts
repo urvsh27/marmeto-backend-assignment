@@ -19,9 +19,16 @@ async function list() {
 
   console.log(`${dead.length} dead job(s):\n`);
   for (const job of dead) {
-    console.log(`  ${job.orderId}  ${job.type}  ${job.attempts} attempts  ${job.updatedAt.toISOString()}`);
+    const why = job.failureKind === "rejected" ? "refused by the courier" : "out of attempts";
+    console.log(
+      `  ${job.orderId}  ${job.type}  ${job.attempts} attempts  ${why}  ${job.updatedAt.toISOString()}`
+    );
     console.log(`    ${job.lastError ?? "no error recorded"}`);
   }
+  console.log(
+    `\nreconcile retries the ones that ran out of attempts. a refused one needs the` +
+      ` request looking at first, then a replay.`
+  );
   console.log(`\nreplay one with: npm run replay <orderId>`);
 }
 

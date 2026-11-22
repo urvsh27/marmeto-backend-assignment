@@ -2,7 +2,7 @@ import { Op } from "sequelize";
 import { config } from "../config";
 import { Courier } from "../courier/client";
 import { Order, OrderStatus } from "../db/models";
-import { activeOrderIds, completeFor, reset } from "../queue/jobs";
+import { activeOrderIds, completeFor, rejectedOrderIds, reset } from "../queue/jobs";
 import { markShipped } from "./createShipment";
 
 export type ReconcileReport = {
@@ -10,6 +10,9 @@ export type ReconcileReport = {
   recorded: string[];
   requeued: string[];
   skippedInFlight: number;
+  // parked because the courier refused the request. requeuing these would fail
+  // the same way on every run, so they wait for a human.
+  skippedRejected: string[];
 };
 
 // Finds orders that should have shipped by now and haven't, and works out which
@@ -36,12 +39,14 @@ export async function reconcile(
   // anything the queue is already dealing with is left alone: the worker's
   // retry path is the normal route and this would only get in its way
   const active = await activeOrderIds();
+  const rejected = await rejectedOrderIds();
 
   const report: ReconcileReport = {
     checked: 0,
     recorded: [],
     requeued: [],
     skippedInFlight: 0,
+    skippedRejected: [],
   };
 
   for (const order of stale) {
@@ -66,6 +71,15 @@ export async function reconcile(
       await markShipped(order.orderId, keep.shipmentId);
       await completeFor(order.orderId);
       report.recorded.push(`${order.orderId} -> ${keep.shipmentId}`);
+      continue;
+    }
+
+    // The courier refused this request, so putting the job back would fail the
+    // same way and this would requeue it on every run. The lookup above still
+    // ran, because an earlier attempt may have created a shipment before the
+    // rejection, and recording that is always right. Only the retry is skipped.
+    if (rejected.has(order.orderId)) {
+      report.skippedRejected.push(order.orderId);
       continue;
     }
 

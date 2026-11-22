@@ -33,7 +33,16 @@ async function main() {
     for (const orderId of report.requeued) console.log(`  ${orderId}`);
   }
 
-  if (report.recorded.length === 0 && report.requeued.length === 0) {
+  if (report.skippedRejected.length > 0) {
+    console.log(`\nthe courier refused these, they need a look before a replay:`);
+    for (const orderId of report.skippedRejected) console.log(`  ${orderId}`);
+  }
+
+  if (
+    report.recorded.length === 0 &&
+    report.requeued.length === 0 &&
+    report.skippedRejected.length === 0
+  ) {
     console.log("nothing to do");
   }
 

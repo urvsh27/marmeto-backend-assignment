@@ -106,28 +106,70 @@ export async function complete(jobId: string): Promise<void> {
   );
 }
 
+export type SweepResult = {
+  requeued: string[];
+  // ran out of attempts while nobody was holding them, so they are parked rather
+  // than put back
+  parked: string[];
+};
+
 // A worker that is killed mid-job leaves the row in processing with nobody
 // working on it, and nothing would ever claim it again. Anything locked for
-// longer than a job could plausibly take goes back to pending.
+// longer than a job could plausibly take is picked up here.
 //
-// attempts is deliberately not reset: a job that kills the worker every time
-// would otherwise loop forever instead of eventually reaching dead.
+// attempts is not reset, and jobs that have none left are marked dead instead of
+// requeued. Both halves are needed: a job that kills the worker every time never
+// reaches the handler's error path, so if this only requeued it, it would cycle
+// processing -> pending forever and never be parked.
 //
-// The timeout has to be longer than the slowest real job, or this will requeue
-// work that is still running and two workers will do it at once. Harmless here
-// because of the check-by-reference, but still wrong.
-export async function requeueStuck(olderThanSeconds: number): Promise<string[]> {
-  const rows = await sequelize.query<{ order_id: string }>(
+// The lock timeout has to be longer than the slowest real job. If it isn't, a
+// job that is still running gets requeued and a second worker picks it up while
+// the first is mid-call. Check-by-reference does NOT save you there: both
+// workers can look, both see nothing, and both create. What keeps one worker per
+// job is SKIP LOCKED plus this timeout being comfortably above the slowest job.
+export async function requeueStuck(
+  olderThanSeconds: number,
+  maxAttempts: number
+): Promise<SweepResult> {
+  const stuck = `status = 'processing'
+                 AND (locked_at IS NULL
+                      OR locked_at < now() - make_interval(secs => $olderThanSeconds))`;
+
+  const parked = await sequelize.query<{ order_id: string }>(
     `UPDATE jobs
-        SET status = 'pending', locked_at = NULL, updated_at = now()
-      WHERE status = 'processing'
-        AND (locked_at IS NULL
-             OR locked_at < now() - make_interval(secs => $olderThanSeconds))
+        SET status = 'dead',
+            locked_at = NULL,
+            failure_kind = 'exhausted',
+            last_error = coalesce(last_error, 'worker stopped before finishing'),
+            updated_at = now()
+      WHERE ${stuck} AND attempts >= $maxAttempts
       RETURNING order_id`,
-    { bind: { olderThanSeconds }, type: QueryTypes.SELECT }
+    { bind: { olderThanSeconds, maxAttempts }, type: QueryTypes.SELECT }
   );
 
-  return rows.map((row) => row.order_id);
+  const requeued = await sequelize.query<{ order_id: string }>(
+    `UPDATE jobs
+        SET status = 'pending', locked_at = NULL, updated_at = now()
+      WHERE ${stuck} AND attempts < $maxAttempts
+      RETURNING order_id`,
+    { bind: { olderThanSeconds, maxAttempts }, type: QueryTypes.SELECT }
+  );
+
+  return {
+    requeued: requeued.map((row) => row.order_id),
+    parked: parked.map((row) => row.order_id),
+  };
+}
+
+// Orders whose job was parked because the courier refused the request. Retrying
+// those fails the same way, so reconcile leaves them for a human.
+export async function rejectedOrderIds(): Promise<Set<string>> {
+  const rows = await sequelize.query<{ order_id: string }>(
+    `SELECT order_id FROM jobs WHERE status = 'dead' AND failure_kind = 'rejected'`,
+    { type: QueryTypes.SELECT }
+  );
+
+  return new Set(rows.map((row) => row.order_id));
 }
 
 // Orders that something is already working on, or is about to. Reconcile uses
@@ -166,14 +208,17 @@ export type DeadJob = {
   type: string;
   attempts: number;
   lastError: string | null;
+  failureKind: FailureKind | null;
   updatedAt: Date;
 };
 
 // "Somewhere visible" from the brief. Dead jobs are rows you can query, not log
 // lines, which is what makes them findable and replayable later.
 export async function listDead(limit = 50): Promise<DeadJob[]> {
-  const rows = await sequelize.query<Omit<JobRow, "run_at"> & { updated_at: Date }>(
-    `SELECT id, order_id, type, attempts, last_error, updated_at
+  const rows = await sequelize.query<
+    Omit<JobRow, "run_at"> & { updated_at: Date; failure_kind: FailureKind | null }
+  >(
+    `SELECT id, order_id, type, attempts, last_error, failure_kind, updated_at
        FROM jobs
       WHERE status = 'dead'
       ORDER BY updated_at DESC
@@ -187,6 +232,7 @@ export async function listDead(limit = 50): Promise<DeadJob[]> {
     type: row.type,
     attempts: row.attempts,
     lastError: row.last_error,
+    failureKind: row.failure_kind,
     updatedAt: row.updated_at,
   }));
 }
@@ -205,6 +251,7 @@ export async function reset(orderId: string, type: string = CREATE_SHIPMENT): Pr
             attempts = 0,
             run_at = now(),
             locked_at = NULL,
+            failure_kind = NULL,
             updated_at = now()
       WHERE order_id = $orderId
         AND type = $type
@@ -219,12 +266,22 @@ export async function reset(orderId: string, type: string = CREATE_SHIPMENT): Pr
 // Parked. Nothing claims it again until something sets it back to pending, which
 // is what scripts/replay.ts and the reconcile job do. The error stays on the row
 // so you can see why from a query.
-export async function markDead(jobId: string, lastError: string): Promise<void> {
+export type FailureKind = "rejected" | "exhausted";
+
+export async function markDead(
+  jobId: string,
+  lastError: string,
+  failureKind: FailureKind
+): Promise<void> {
   await sequelize.query(
     `UPDATE jobs
-        SET status = 'dead', locked_at = NULL, last_error = $lastError, updated_at = now()
+        SET status = 'dead',
+            locked_at = NULL,
+            last_error = $lastError,
+            failure_kind = $failureKind,
+            updated_at = now()
       WHERE id = $jobId`,
-    { bind: { jobId, lastError }, type: QueryTypes.UPDATE }
+    { bind: { jobId, lastError, failureKind }, type: QueryTypes.UPDATE }
   );
 }
 

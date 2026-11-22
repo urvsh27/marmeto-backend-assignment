@@ -2,7 +2,16 @@ import { config } from "./config";
 import { CourierError, createCourierClient } from "./courier/client";
 import { sequelize } from "./db";
 import { backoffSeconds } from "./lib/backoff";
-import { JobHandler, claim, complete, markDead, requeueStuck, retryLater } from "./queue/jobs";
+import {
+  FailureKind,
+  JobHandler,
+  SweepResult,
+  claim,
+  complete,
+  markDead,
+  requeueStuck,
+  retryLater,
+} from "./queue/jobs";
 import { makeShipmentHandler, markOrderFailed } from "./shipping/createShipment";
 
 // docker sends SIGKILL ten seconds after SIGTERM, so give up before that
@@ -12,21 +21,33 @@ export type Outcome = "idle" | "done" | "retrying" | "dead";
 
 const shipWithRealCourier = makeShipmentHandler(createCourierClient());
 
-type Decision = { dead: true; reason: string } | { dead: false; delaySeconds: number };
+type Decision =
+  | { dead: true; kind: FailureKind; reason: string }
+  | { dead: false; delaySeconds: number };
 
 // Whether to try this job again, and how long to wait.
 //   other 4xx  -> our request is wrong, the same request will fail again
 //   out of attempts -> park it for a human instead of retrying forever
 //   429        -> exactly as long as the courier asked, it knows its own limits
 //   5xx, timeout, unreachable -> jittered backoff on the attempt count
+//
+// A 429 counts as an attempt like anything else, so a courier that is merely
+// busy can still use up a job's attempts. That is deliberate: a job cannot sit
+// in the queue indefinitely, and reconcile will pick it up afterwards. A
+// separate, larger allowance for rate limiting would be the better answer at
+// higher volume.
 function decide(err: unknown, attempts: number): Decision {
   if (err instanceof CourierError && !err.retryable) {
-    return { dead: true, reason: `courier rejected the request (${err.status ?? "4xx"})` };
+    return {
+      dead: true,
+      kind: "rejected",
+      reason: `courier rejected the request (${err.status ?? "4xx"})`,
+    };
   }
 
   // attempts is already incremented by claim, so this is the number of tries made
   if (attempts >= config.maxAttempts) {
-    return { dead: true, reason: `gave up after ${attempts} attempts` };
+    return { dead: true, kind: "exhausted", reason: `gave up after ${attempts} attempts` };
   }
 
   if (err instanceof CourierError && err.kind === "rate_limited" && err.retryAfterSeconds !== undefined) {
@@ -34,7 +55,8 @@ function decide(err: unknown, attempts: number): Decision {
   }
 
   // anything that isn't a CourierError is a bug on our side, but retrying is
-  // still safer than dropping the job: check-by-reference makes it harmless
+  // still safer than dropping the job. the retry is sequential, so the lookup at
+  // the start of the next attempt will find anything the failed one created.
   return { dead: false, delaySeconds: backoffSeconds(attempts) };
 }
 
@@ -56,7 +78,7 @@ export async function runOnce(handler: JobHandler = shipWithRealCourier): Promis
       console.error(
         `job ${job.id} order ${job.orderId} parked as dead, ${decision.reason}: ${message}`
       );
-      await markDead(job.id, message);
+      await markDead(job.id, message, decision.kind);
       await markOrderFailed(job.orderId);
       return "dead";
     }
@@ -69,14 +91,27 @@ export async function runOnce(handler: JobHandler = shipWithRealCourier): Promis
   }
 }
 
-// Recovers jobs left behind by a worker that died. Exported so it can be tested
-// without running the loop.
-export async function sweepStuck(): Promise<string[]> {
-  const requeued = await requeueStuck(config.jobLockTimeoutSeconds);
-  if (requeued.length > 0) {
-    console.warn(`requeued ${requeued.length} stuck job(s): ${requeued.join(", ")}`);
+// Recovers jobs left behind by a worker that died. Anything with no attempts
+// left is parked instead of requeued, otherwise a job that kills the worker
+// every time would go round forever without ever reaching dead. Exported so it
+// can be tested without running the loop.
+export async function sweepStuck(): Promise<SweepResult> {
+  const result = await requeueStuck(config.jobLockTimeoutSeconds, config.maxAttempts);
+
+  if (result.requeued.length > 0) {
+    console.warn(`requeued ${result.requeued.length} stuck job(s): ${result.requeued.join(", ")}`);
   }
-  return requeued;
+
+  for (const orderId of result.parked) {
+    await markOrderFailed(orderId);
+  }
+  if (result.parked.length > 0) {
+    console.error(
+      `parked ${result.parked.length} stuck job(s) with no attempts left: ${result.parked.join(", ")}`
+    );
+  }
+
+  return result;
 }
 
 function sleep(ms: number) {

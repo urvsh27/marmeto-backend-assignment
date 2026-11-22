@@ -5,7 +5,7 @@ import { Courier } from "../src/courier/client";
 import { sequelize } from "../src/db";
 import { claim, enqueue, requeueStuck } from "../src/queue/jobs";
 import { makeShipmentHandler } from "../src/shipping/createShipment";
-import { runOnce } from "../src/worker";
+import { runOnce, sweepStuck } from "../src/worker";
 
 const working: Courier = {
   async findShipments() {
@@ -52,7 +52,7 @@ describe("requeueStuck", () => {
   it("does nothing when no job is processing", async () => {
     await givenQueuedOrder("1001");
 
-    expect(await requeueStuck(60)).toEqual([]);
+    expect((await requeueStuck(60, config.maxAttempts)).requeued).toEqual([]);
     expect((await job("1001")).status).toBe("pending");
   });
 
@@ -60,7 +60,7 @@ describe("requeueStuck", () => {
     await givenQueuedOrder("1001");
     await claim();
 
-    expect(await requeueStuck(60)).toEqual([]);
+    expect((await requeueStuck(60, config.maxAttempts)).requeued).toEqual([]);
     expect((await job("1001")).status).toBe("processing");
   });
 
@@ -69,7 +69,7 @@ describe("requeueStuck", () => {
     await claim();
     await abandon("1001", 120);
 
-    expect(await requeueStuck(60)).toEqual(["1001"]);
+    expect((await requeueStuck(60, config.maxAttempts)).requeued).toEqual(["1001"]);
 
     const row = await job("1001");
     expect(row.status).toBe("pending");
@@ -82,7 +82,7 @@ describe("requeueStuck", () => {
     expect((await job("1001")).attempts).toBe(1);
 
     await abandon("1001", 120);
-    await requeueStuck(60);
+    await requeueStuck(60, config.maxAttempts);
 
     expect((await job("1001")).attempts).toBe(1);
   });
@@ -91,7 +91,7 @@ describe("requeueStuck", () => {
     await givenQueuedOrder("1001");
     await claim();
     await abandon("1001", 120);
-    await requeueStuck(60);
+    await requeueStuck(60, config.maxAttempts);
 
     expect(await runOnce(makeShipmentHandler(working))).toBe("done");
     expect((await job("1001")).status).toBe("done");
@@ -109,7 +109,7 @@ describe("requeueStuck", () => {
     await abandon("1001", 120);
     await abandon("1002", 120);
 
-    const requeued = await requeueStuck(60);
+    const { requeued } = await requeueStuck(60, config.maxAttempts);
 
     expect(requeued.sort()).toEqual(["1001", "1002"]);
     expect((await job("1003")).status).toBe("processing");
@@ -122,7 +122,7 @@ describe("requeueStuck", () => {
     await claim();
     await sequelize.query(`UPDATE jobs SET locked_at = NULL WHERE order_id = '1001'`);
 
-    expect(await requeueStuck(60)).toEqual(["1001"]);
+    expect((await requeueStuck(60, config.maxAttempts)).requeued).toEqual(["1001"]);
     expect((await job("1001")).status).toBe("pending");
   });
 
@@ -136,30 +136,76 @@ describe("requeueStuck", () => {
       `UPDATE jobs SET status = 'dead', locked_at = now() - interval '1 hour' WHERE order_id = '1002'`
     );
 
-    expect(await requeueStuck(60)).toEqual([]);
+    expect((await requeueStuck(60, config.maxAttempts)).requeued).toEqual([]);
     expect((await job("1001")).status).toBe("done");
     expect((await job("1002")).status).toBe("dead");
   });
 
-  it("a stuck job that keeps getting abandoned still reaches the attempt limit", async () => {
+  // The important one. A job that kills the worker outright never reaches the
+  // handler's error path, so the sweep is the only thing that can ever park it.
+  // Nothing in this test throws.
+  it("parks a job that keeps killing the worker, without any handler running", async () => {
     await givenQueuedOrder("1001");
 
+    let parkedAt = 0;
+    for (let cycle = 1; cycle <= config.maxAttempts * 3; cycle++) {
+      await claim();
+      await abandon("1001", 120);
+      const { parked } = await requeueStuck(60, config.maxAttempts);
+      if (parked.length > 0) {
+        parkedAt = cycle;
+        break;
+      }
+    }
+
+    expect(parkedAt).toBe(config.maxAttempts);
+    const row = await job("1001");
+    expect(row.status).toBe("dead");
+    expect(row.attempts).toBe(config.maxAttempts);
+    expect(row.locked_at).toBeNull();
+  });
+
+  it("records why the sweep parked it", async () => {
+    await givenQueuedOrder("1001");
     for (let i = 0; i < config.maxAttempts; i++) {
       await claim();
       await abandon("1001", 120);
-      await requeueStuck(60);
+      await requeueStuck(60, config.maxAttempts);
     }
 
+    const [row] = await sequelize.query<{ failure_kind: string; last_error: string }>(
+      `SELECT failure_kind, last_error FROM jobs WHERE order_id = '1001'`,
+      { type: QueryTypes.SELECT }
+    );
+    expect(row.failure_kind).toBe("exhausted");
+    expect(row.last_error).toBe("worker stopped before finishing");
+  });
+
+  it("never lets attempts go past the limit", async () => {
+    await givenQueuedOrder("1001");
+    for (let i = 0; i < config.maxAttempts * 2; i++) {
+      await claim();
+      await abandon("1001", 120);
+      await requeueStuck(60, config.maxAttempts);
+    }
+
+    // the old behaviour let this climb for ever, and the "gave up after N"
+    // message then reported one more than MAX_ATTEMPTS
     expect((await job("1001")).attempts).toBe(config.maxAttempts);
-    // the next failure has no attempts left, so it gets parked rather than retried
-    const dying: Courier = {
-      async findShipments() {
-        throw new Error("still broken");
-      },
-      async createShipment() {
-        throw new Error("unreachable");
-      },
-    };
-    expect(await runOnce(makeShipmentHandler(dying))).toBe("dead");
+  });
+
+  it("the parked order is marked failed when the worker sweeps", async () => {
+    await givenQueuedOrder("1001");
+    for (let i = 0; i < config.maxAttempts; i++) {
+      await claim();
+      await abandon("1001", 120);
+      await sweepStuck();
+    }
+
+    const [row] = await sequelize.query<{ status: string }>(
+      `SELECT status FROM orders WHERE order_id = '1001'`,
+      { type: QueryTypes.SELECT }
+    );
+    expect(row.status).toBe("failed");
   });
 });

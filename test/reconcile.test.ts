@@ -55,10 +55,12 @@ async function job(orderId: string) {
   return row;
 }
 
-async function park(orderId: string) {
+async function park(orderId: string, failureKind: "exhausted" | "rejected" = "exhausted") {
   await sequelize.query(
-    `UPDATE jobs SET status = 'dead', attempts = 5, last_error = 'gave up' WHERE order_id = $orderId`,
-    { bind: { orderId }, type: QueryTypes.UPDATE }
+    `UPDATE jobs SET status = 'dead', attempts = 5, last_error = 'gave up',
+            failure_kind = $failureKind
+      WHERE order_id = $orderId`,
+    { bind: { orderId, failureKind }, type: QueryTypes.UPDATE }
   );
   await sequelize.query(`UPDATE orders SET status = 'failed' WHERE order_id = $orderId`, {
     bind: { orderId },
@@ -80,7 +82,13 @@ describe("reconcile", () => {
 
     const report = await reconcile(lookupOnlyCourier(), 10);
 
-    expect(report).toEqual({ checked: 0, recorded: [], requeued: [], skippedInFlight: 0 });
+    expect(report).toEqual({
+      checked: 0,
+      recorded: [],
+      requeued: [],
+      skippedInFlight: 0,
+      skippedRejected: [],
+    });
   });
 
   it("leaves recent orders alone, the worker has not had its chance yet", async () => {
@@ -159,6 +167,43 @@ describe("reconcile", () => {
     await park("1002");
 
     await expect(reconcile(lookupOnlyCourier(), 10)).resolves.toBeTruthy();
+  });
+
+  // the courier refused the request, so retrying it just fails the same way.
+  // without this, every reconcile run requeued it and the worker killed it again.
+  it("leaves a job the courier refused parked, run after run", async () => {
+    await givenOrder("1001");
+    await park("1001", "rejected");
+
+    for (let pass = 1; pass <= 3; pass++) {
+      const report = await reconcile(lookupOnlyCourier(), 10);
+      expect(report.requeued).toEqual([]);
+      expect(report.skippedRejected).toEqual(["1001"]);
+      expect((await job("1001")).status).toBe("dead");
+    }
+  });
+
+  it("still records a shipment for a refused order if the courier has one", async () => {
+    // an earlier attempt may have created it before a later one was refused
+    await givenOrder("1001");
+    await park("1001", "rejected");
+    const courier = lookupOnlyCourier([{ shipmentId: "SHIP-EARLIER", reference: "1001" }]);
+
+    const report = await reconcile(courier, 10);
+
+    expect(report.recorded).toEqual(["1001 -> SHIP-EARLIER"]);
+    expect(report.skippedRejected).toEqual([]);
+    expect(await order("1001")).toEqual({ status: "shipped", shipment_id: "SHIP-EARLIER" });
+  });
+
+  it("still requeues a job that merely ran out of attempts", async () => {
+    await givenOrder("1001");
+    await park("1001", "exhausted");
+
+    const report = await reconcile(lookupOnlyCourier(), 10);
+
+    expect(report.requeued).toEqual(["1001"]);
+    expect(report.skippedRejected).toEqual([]);
   });
 
   it("is safe to run twice", async () => {
