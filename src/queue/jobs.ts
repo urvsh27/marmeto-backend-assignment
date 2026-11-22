@@ -130,6 +130,36 @@ export async function requeueStuck(olderThanSeconds: number): Promise<string[]> 
   return rows.map((row) => row.order_id);
 }
 
+// Orders that something is already working on, or is about to. Reconcile uses
+// this to leave them alone rather than interfering with the normal retry path.
+// It is here, not in the reconcile script, because which job states count as
+// "in flight" is the queue's business and would change with the queue.
+export async function activeOrderIds(): Promise<Set<string>> {
+  const rows = await sequelize.query<{ order_id: string }>(
+    `SELECT DISTINCT order_id FROM jobs WHERE status IN ('pending', 'processing')`,
+    { type: QueryTypes.SELECT }
+  );
+
+  return new Set(rows.map((row) => row.order_id));
+}
+
+// Marks the job for an order done without needing its id, which reconcile
+// doesn't have.
+export async function completeFor(
+  orderId: string,
+  type: string = CREATE_SHIPMENT
+): Promise<boolean> {
+  const rows = await sequelize.query<{ id: string }>(
+    `UPDATE jobs
+        SET status = 'done', locked_at = NULL, last_error = NULL, updated_at = now()
+      WHERE order_id = $orderId AND type = $type AND status <> 'processing'
+      RETURNING id`,
+    { bind: { orderId, type }, type: QueryTypes.SELECT }
+  );
+
+  return rows.length > 0;
+}
+
 export type DeadJob = {
   id: string;
   orderId: string;

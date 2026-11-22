@@ -26,6 +26,9 @@ export const config = {
   maxAttempts: Number(process.env.MAX_ATTEMPTS ?? 5),
   // must be longer than the slowest job, or a job still running gets requeued
   jobLockTimeoutSeconds: Number(process.env.JOB_LOCK_TIMEOUT_SECONDS ?? 60),
+  // how long an order can sit unshipped before reconcile looks at it. long
+  // enough that the normal retry path has had its chance first.
+  reconcileAfterMinutes: Number(process.env.RECONCILE_AFTER_MINUTES ?? 10),
   retryBaseSeconds: Number(process.env.RETRY_BASE_SECONDS ?? 2),
   retryMaxSeconds: Number(process.env.RETRY_MAX_SECONDS ?? 60),
 };

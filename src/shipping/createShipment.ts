@@ -4,7 +4,7 @@ import { JobHandler } from "../queue/jobs";
 
 // Order state lives here. Job state lives in src/queue/jobs.ts. The worker only
 // decides which to call.
-async function markShipped(orderId: string, shipmentId: string): Promise<void> {
+export async function markShipped(orderId: string, shipmentId: string): Promise<void> {
   await Order.update({ status: OrderStatus.shipped, shipmentId }, { where: { orderId } });
 }
 

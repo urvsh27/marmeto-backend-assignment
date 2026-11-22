@@ -1,3 +1,17 @@
+# docker compose up
+#
+# postgres -> migrate (runs once, to completion) -> api, worker, mock
+# All four app services run the same image with different commands.
+
+x-app: &app
+  image: marmeto-backend-assignment:local
+  build: .
+  environment: &app-env
+    NODE_ENV: production
+    DATABASE_URL: postgres://postgres:postgres@postgres:5432/marmeto
+    WEBHOOK_SECRET: ${WEBHOOK_SECRET:-dev-shared-secret}
+    COURIER_BASE_URL: http://mock:4000
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -14,6 +28,60 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # runs the migrations and exits. api and worker wait for it to succeed, so they
+  # never start against a database without tables.
+  migrate:
+    <<: *app
+    command: ["node", "dist/src/db/migrate.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  mock:
+    <<: *app
+    command: ["node", "mock-courier.js"]
+    environment:
+      <<: *app-env
+      COURIER_PORT: 4000
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    command: ["node", "dist/src/server.js"]
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    <<: *app
+    command: ["node", "dist/src/worker.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      mock:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
   pgdata:
