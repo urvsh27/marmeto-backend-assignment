@@ -20,5 +20,9 @@ export const config = {
   dbLogging: process.env.DB_LOGGING === "true",
   webhookSecret: required("WEBHOOK_SECRET"),
   courierBaseUrl: process.env.COURIER_BASE_URL ?? "http://localhost:4000",
+  // the mock hangs for 10s on ~10% of calls, so this has to give up well before
+  courierTimeoutMs: Number(process.env.COURIER_TIMEOUT_MS ?? 5000),
   workerPollMs: Number(process.env.WORKER_POLL_MS ?? 1000),
+  retryBaseSeconds: Number(process.env.RETRY_BASE_SECONDS ?? 2),
+  retryMaxSeconds: Number(process.env.RETRY_MAX_SECONDS ?? 60),
 };
