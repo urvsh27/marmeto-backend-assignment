@@ -10,8 +10,9 @@
     "dev": "tsx watch src/server.ts",
     "mock": "node mock-courier.js",
     "migrate": "tsx src/db/migrate.ts",
+    "send-webhook": "tsx scripts/send-webhook.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js"
+    "start": "node dist/src/server.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

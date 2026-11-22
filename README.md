@@ -47,9 +47,33 @@ curl localhost:3000/health
 
 ### Sending a signed webhook
 
+```bash
+npm run send-webhook
+```
+
+That sends four requests for one order and prints what came back:
+
+```
+new order                        202  {"orderId":"ORD-...","duplicate":false}
+same webhook id again            200  {"orderId":"ORD-...","duplicate":true}
+new webhook id, same order       200  {"orderId":"ORD-...","duplicate":true}
+tampered body                    401  {"error":"invalid signature"}
+```
+
+Both duplicate paths from the spec, plus a bad signature. It exits non-zero if
+any of them misbehaves, so it works as a smoke test. Pass an order id to reuse
+one:
+
+```bash
+npm run send-webhook ORD-123
+```
+
+Run that twice and the first line comes back `200 duplicate:true` instead of
+`202`, because the order is already stored.
+
 `POST /webhooks/orders-create` checks an HMAC-SHA256 of the raw body, base64, in
 the `X-Shop-Hmac-Sha256` header, against `WEBHOOK_SECRET`. Anything that doesn't
-match gets a 401. By hand:
+match gets a 401. The same thing by hand:
 
 ```bash
 BODY='{"id":1001,"line_items":[{"sku":"A","quantity":2}],"shipping_address":{"city":"Pune"}}'
@@ -61,8 +85,7 @@ curl -i -X POST localhost:3000/webhooks/orders-create \
   -d "$BODY"
 ```
 
-Change a byte of the body without re-signing and it's a 401. Step 7 adds
-`scripts/send-webhook.ts` so you don't have to do this by hand.
+Change a byte of the body without re-signing and it's a 401.
 
 A new order gets `202 {"orderId":"1001","duplicate":false}`. 202 rather than 200
 because the courier hasn't been called yet, the job is only queued. Anything

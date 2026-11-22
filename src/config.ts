@@ -9,8 +9,12 @@ function required(name: string): string {
   return value;
 }
 
+const port = Number(process.env.PORT ?? 3000);
+
 export const config = {
-  port: Number(process.env.PORT ?? 3000),
+  port,
+  // only used by the scripts, so they can point at a container or another host
+  apiBaseUrl: process.env.API_BASE_URL ?? `http://localhost:${port}`,
   nodeEnv: process.env.NODE_ENV ?? "development",
   databaseUrl: required("DATABASE_URL"),
   dbLogging: process.env.DB_LOGGING === "true",
