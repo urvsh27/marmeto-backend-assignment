@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
+    "worker": "tsx watch src/worker.ts",
     "mock": "node mock-courier.js",
     "migrate": "tsx src/db/migrate.ts",
     "send-webhook": "tsx scripts/send-webhook.ts",

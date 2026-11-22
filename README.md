@@ -128,6 +128,21 @@ what we stored, so quietly replacing it would be worse. The delivery is kept in
 Real changes arrive on `orders/updated` and `orders/cancelled`, which are out of
 scope here.
 
+The worker, in another terminal:
+
+```bash
+npm run worker
+```
+
+It polls for due jobs (`WORKER_POLL_MS`, 1000 by default), claims one at a time
+and runs it. Right now the handler only logs — the courier call arrives in the
+next steps. On SIGINT or SIGTERM it stops claiming, finishes the job in hand and
+closes the pool, so `docker compose down` doesn't abandon work mid-flight.
+
+Several workers can run at once. The claim is a single `UPDATE ... WHERE id = (
+SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1)`, so a worker locks the row it took
+and any other worker steps over it rather than queueing behind it.
+
 The mock courier, in another terminal:
 
 ```bash

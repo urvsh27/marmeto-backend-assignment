@@ -35,10 +35,10 @@ async function intake(
     // the winner, so two concurrent deliveries cannot both think they are first.
     const events = await sequelize.query<{ webhook_id: string }>(
       `INSERT INTO webhook_events (webhook_id, order_id, payload)
-       VALUES (:webhookId, :orderId, :payload::jsonb)
+       VALUES ($webhookId, $orderId, $payload::jsonb)
        ON CONFLICT (webhook_id) DO NOTHING
        RETURNING webhook_id`,
-      { replacements: { webhookId, orderId, payload: json }, transaction, type: QueryTypes.SELECT }
+      { bind: { webhookId, orderId, payload: json }, transaction, type: QueryTypes.SELECT }
     );
 
     // the exact same delivery again. nothing else to do.
@@ -46,10 +46,10 @@ async function intake(
 
     const orders = await sequelize.query<{ order_id: string }>(
       `INSERT INTO orders (order_id, payload)
-       VALUES (:orderId, :payload::jsonb)
+       VALUES ($orderId, $payload::jsonb)
        ON CONFLICT (order_id) DO NOTHING
        RETURNING order_id`,
-      { replacements: { orderId, payload: json }, transaction, type: QueryTypes.SELECT }
+      { bind: { orderId, payload: json }, transaction, type: QueryTypes.SELECT }
     );
 
     if (orders.length === 0) {
@@ -57,8 +57,8 @@ async function intake(
       // because a shipment may already have been created from it. compared with
       // jsonb equality so key order doesn't matter.
       const [stored] = await sequelize.query<{ same: boolean }>(
-        `SELECT payload = :payload::jsonb AS same FROM orders WHERE order_id = :orderId`,
-        { replacements: { orderId, payload: json }, transaction, type: QueryTypes.SELECT }
+        `SELECT payload = $payload::jsonb AS same FROM orders WHERE order_id = $orderId`,
+        { bind: { orderId, payload: json }, transaction, type: QueryTypes.SELECT }
       );
       if (stored && !stored.same) {
         console.warn(

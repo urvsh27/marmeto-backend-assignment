@@ -20,4 +20,5 @@ export const config = {
   dbLogging: process.env.DB_LOGGING === "true",
   webhookSecret: required("WEBHOOK_SECRET"),
   courierBaseUrl: process.env.COURIER_BASE_URL ?? "http://localhost:4000",
+  workerPollMs: Number(process.env.WORKER_POLL_MS ?? 1000),
 };
