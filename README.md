@@ -19,6 +19,22 @@ npm install
 cp .env.example .env
 ```
 
+Postgres. There is no app container yet, so compose only brings up the database:
+
+```bash
+docker compose up -d postgres
+```
+
+```bash
+npm run migrate
+```
+
+`npm run migrate down` rolls back the last migration. Set `DB_LOGGING=true` in
+`.env` if you want to see the SQL.
+
+If you already run Postgres locally, skip compose and point `DATABASE_URL` at
+your own instance instead.
+
 The API:
 
 ```bash
@@ -39,7 +55,8 @@ npm run mock
 curl localhost:4000/health
 ```
 
-Postgres, migrations, the worker and `docker compose up` come in later steps.
+The worker and a single `docker compose up` that runs everything come in later
+steps.
 
 ## Mock courier
 
