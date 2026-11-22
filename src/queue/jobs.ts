@@ -106,6 +106,86 @@ export async function complete(jobId: string): Promise<void> {
   );
 }
 
+// A worker that is killed mid-job leaves the row in processing with nobody
+// working on it, and nothing would ever claim it again. Anything locked for
+// longer than a job could plausibly take goes back to pending.
+//
+// attempts is deliberately not reset: a job that kills the worker every time
+// would otherwise loop forever instead of eventually reaching dead.
+//
+// The timeout has to be longer than the slowest real job, or this will requeue
+// work that is still running and two workers will do it at once. Harmless here
+// because of the check-by-reference, but still wrong.
+export async function requeueStuck(olderThanSeconds: number): Promise<string[]> {
+  const rows = await sequelize.query<{ order_id: string }>(
+    `UPDATE jobs
+        SET status = 'pending', locked_at = NULL, updated_at = now()
+      WHERE status = 'processing'
+        AND (locked_at IS NULL
+             OR locked_at < now() - make_interval(secs => $olderThanSeconds))
+      RETURNING order_id`,
+    { bind: { olderThanSeconds }, type: QueryTypes.SELECT }
+  );
+
+  return rows.map((row) => row.order_id);
+}
+
+export type DeadJob = {
+  id: string;
+  orderId: string;
+  type: string;
+  attempts: number;
+  lastError: string | null;
+  updatedAt: Date;
+};
+
+// "Somewhere visible" from the brief. Dead jobs are rows you can query, not log
+// lines, which is what makes them findable and replayable later.
+export async function listDead(limit = 50): Promise<DeadJob[]> {
+  const rows = await sequelize.query<Omit<JobRow, "run_at"> & { updated_at: Date }>(
+    `SELECT id, order_id, type, attempts, last_error, updated_at
+       FROM jobs
+      WHERE status = 'dead'
+      ORDER BY updated_at DESC
+      LIMIT $limit`,
+    { bind: { limit }, type: QueryTypes.SELECT }
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    orderId: row.order_id,
+    type: row.type,
+    attempts: row.attempts,
+    lastError: row.last_error,
+    updatedAt: row.updated_at,
+  }));
+}
+
+// Puts an existing job back in the queue. Used by the replay script and by
+// reconcile. It never inserts, so the one-job-per-order-and-type rule holds no
+// matter how many times either runs.
+//
+// A job that is currently processing is left alone: a worker is holding it, and
+// resetting it underneath would have two workers on the same order. A worker
+// that died leaves it processing too, but requeueStuck is what recovers those.
+export async function reset(orderId: string, type: string = CREATE_SHIPMENT): Promise<boolean> {
+  const rows = await sequelize.query<{ id: string }>(
+    `UPDATE jobs
+        SET status = 'pending',
+            attempts = 0,
+            run_at = now(),
+            locked_at = NULL,
+            updated_at = now()
+      WHERE order_id = $orderId
+        AND type = $type
+        AND status <> 'processing'
+      RETURNING id`,
+    { bind: { orderId, type }, type: QueryTypes.SELECT }
+  );
+
+  return rows.length > 0;
+}
+
 // Parked. Nothing claims it again until something sets it back to pending, which
 // is what scripts/replay.ts and the reconcile job do. The error stays on the row
 // so you can see why from a query.

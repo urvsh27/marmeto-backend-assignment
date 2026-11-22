@@ -12,6 +12,15 @@ export async function markOrderFailed(orderId: string): Promise<void> {
   await Order.update({ status: OrderStatus.failed }, { where: { orderId } });
 }
 
+// Back to the starting state so a replayed job is handled normally. Only touches
+// failed orders: a shipped one is finished and must not be reopened.
+export async function markOrderForRetry(orderId: string): Promise<void> {
+  await Order.update(
+    { status: OrderStatus.received },
+    { where: { orderId, status: OrderStatus.failed } }
+  );
+}
+
 // The courier is not idempotent and it sometimes creates a shipment and then
 // hangs, so the id never reaches us. Every attempt therefore asks what already
 // exists for this reference before it creates anything. Without that, a retry

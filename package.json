@@ -12,6 +12,7 @@
     "mock": "node mock-courier.js",
     "migrate": "tsx src/db/migrate.ts",
     "send-webhook": "tsx scripts/send-webhook.ts",
+    "replay": "tsx scripts/replay.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",

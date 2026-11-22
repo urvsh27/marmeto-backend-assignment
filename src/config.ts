@@ -23,6 +23,9 @@ export const config = {
   // the mock hangs for 10s on ~10% of calls, so this has to give up well before
   courierTimeoutMs: Number(process.env.COURIER_TIMEOUT_MS ?? 5000),
   workerPollMs: Number(process.env.WORKER_POLL_MS ?? 1000),
+  maxAttempts: Number(process.env.MAX_ATTEMPTS ?? 5),
+  // must be longer than the slowest job, or a job still running gets requeued
+  jobLockTimeoutSeconds: Number(process.env.JOB_LOCK_TIMEOUT_SECONDS ?? 60),
   retryBaseSeconds: Number(process.env.RETRY_BASE_SECONDS ?? 2),
   retryMaxSeconds: Number(process.env.RETRY_MAX_SECONDS ?? 60),
 };

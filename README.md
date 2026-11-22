@@ -169,6 +169,50 @@ the reconcile job always pick the same one.
 Jitter is there because twenty workers that all got a 500 at the same moment
 would otherwise all come back at the same moment.
 
+After `MAX_ATTEMPTS` tries (5 by default) the job stops retrying: status `dead`,
+order `failed`, last error kept on the row.
+
+### Jobs left behind by a dead worker
+
+A worker that is killed mid-job leaves its row in `processing` with nobody
+working on it, and nothing would ever claim it again. Every worker sweeps for
+those: anything locked longer than `JOB_LOCK_TIMEOUT_SECONDS` (60 by default)
+goes back to `pending`.
+
+The timeout has to be longer than the slowest real job, otherwise a job that is
+still running gets requeued and two workers do it at once.
+
+The attempt count is kept rather than reset. A job that crashes the worker every
+time would otherwise cycle between `processing` and `pending` forever instead of
+eventually being parked.
+
+### Dead jobs
+
+They are rows, not log lines, so you can find them:
+
+```bash
+npm run replay
+```
+
+```
+1 dead job(s):
+
+  DEAD-1  create_shipment  5 attempts  2026-11-22T11:25:15.898Z
+    could not reach the courier: TypeError: fetch failed
+
+replay one with: npm run replay <orderId>
+```
+
+Put one back in the queue:
+
+```bash
+npm run replay DEAD-1
+```
+
+That resets the existing job row to pending with attempts back to zero, and the
+order from `failed` to `received`. It never inserts a job, so replaying twice is
+harmless. An order that is already shipped is left alone.
+
 The mock courier, in another terminal:
 
 ```bash
