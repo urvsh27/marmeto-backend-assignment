@@ -2,9 +2,21 @@ import { Umzug, SequelizeStorage } from "umzug";
 import { QueryInterface } from "sequelize";
 import { sequelize } from "./index";
 
-// the glob matches .ts under tsx in dev and .js under dist in prod
+// glob matches .ts under tsx in dev and .js under dist in prod. drop the
+// extension before storing the name, or the same migration gets recorded as
+// .ts locally and .js in docker and runs a second time.
 export const umzug = new Umzug({
-  migrations: { glob: ["migrations/*.{ts,js}", { cwd: __dirname }] },
+  migrations: {
+    glob: ["migrations/*.{ts,js}", { cwd: __dirname }],
+    resolve: ({ name, path, context }) => {
+      const migration = require(path as string);
+      return {
+        name: name.replace(/\.(ts|js)$/, ""),
+        up: () => migration.up({ context }),
+        down: () => migration.down({ context }),
+      };
+    },
+  },
   context: sequelize.getQueryInterface(),
   storage: new SequelizeStorage({ sequelize }),
   logger: console,
