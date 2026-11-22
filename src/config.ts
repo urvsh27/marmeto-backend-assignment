@@ -1,7 +1,6 @@
 import "dotenv/config";
 
-// Read everything once at startup and fail loudly if something required is
-// missing, rather than discovering it halfway through processing a webhook.
+// read env once at boot. better to crash here than halfway through a webhook.
 function required(name: string): string {
   const value = process.env[name];
   if (!value) {

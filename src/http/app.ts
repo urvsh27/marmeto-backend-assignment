@@ -1,6 +1,6 @@
 import express, { Express } from "express";
 
-// Built as a function so tests can mount the app without starting a listener.
+// factory so tests can mount the app without starting a listener
 export function createApp(): Express {
   const app = express();
 
