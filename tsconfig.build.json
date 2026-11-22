@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "comment": "tsconfig.json covers the tests so the editor and npm run typecheck see them. the build leaves them out of dist.",
+  "include": ["src/**/*.ts", "scripts/**/*.ts"]
+}

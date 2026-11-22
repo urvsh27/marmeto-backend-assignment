@@ -45,6 +45,26 @@ npm run dev
 curl localhost:3000/health
 ```
 
+### Tests
+
+```bash
+npm test
+```
+
+Vitest and Supertest against a real Postgres, not mocks. The suite uses its own
+database (`marmeto_test` by default, `TEST_DATABASE_URL` to change it); it is
+created and migrated on first run, so the only requirement is that Postgres is
+up. Dev data is never touched.
+
+They cover the two things most likely to break: signature verification, and the
+duplicate handling. The duplicate tests assert row counts, not just status
+codes, including ten simultaneous deliveries of one order ending up as one order
+and one job.
+
+```bash
+npm run typecheck
+```
+
 ### Sending a signed webhook
 
 ```bash

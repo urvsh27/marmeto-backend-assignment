@@ -11,7 +11,10 @@
     "mock": "node mock-courier.js",
     "migrate": "tsx src/db/migrate.ts",
     "send-webhook": "tsx scripts/send-webhook.ts",
-    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/src/server.js"
   },
   "dependencies": {
@@ -25,7 +28,11 @@
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^20.17.12",
+    "@types/pg": "^8.23.1",
+    "@types/supertest": "^7.2.1",
+    "supertest": "^7.3.2",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^3.2.7"
   }
 }
