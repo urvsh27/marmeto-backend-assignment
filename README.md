@@ -45,6 +45,46 @@ npm run dev
 curl localhost:3000/health
 ```
 
+### Sending a signed webhook
+
+`POST /webhooks/orders-create` checks an HMAC-SHA256 of the raw body, base64, in
+the `X-Shop-Hmac-Sha256` header, against `WEBHOOK_SECRET`. Anything that doesn't
+match gets a 401. By hand:
+
+```bash
+BODY='{"id":1001,"line_items":[{"sku":"A","quantity":2}],"shipping_address":{"city":"Pune"}}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | base64)
+curl -i -X POST localhost:3000/webhooks/orders-create \
+  -H 'content-type: application/json' \
+  -H "X-Shop-Hmac-Sha256: $SIG" \
+  -H 'X-Shop-Webhook-Id: WH-1' \
+  -d "$BODY"
+```
+
+Change a byte of the body without re-signing and it's a 401. Step 7 adds
+`scripts/send-webhook.ts` so you don't have to do this by hand.
+
+A new order gets `202 {"orderId":"1001","duplicate":false}`. 202 rather than 200
+because the courier hasn't been called yet, the job is only queued. Anything
+already known gets `200 {"duplicate":true}` and no second job.
+
+The endpoint writes three rows in one transaction: the delivery into
+`webhook_events`, the order into `orders`, and a job into `jobs`. They commit
+together, so there is no way to end up with an order nobody will ship.
+
+Duplicates are caught by unique keys rather than by looking first:
+
+- same `X-Shop-Webhook-Id` -> the `webhook_events` insert does nothing, we stop there
+- same order id on a new webhook id -> the delivery is recorded, the order is not
+  overwritten, no job is queued
+
+If a redelivery carries a payload that disagrees with the stored one, the first
+payload wins and the difference gets logged. A shipment may already exist for
+what we stored, so quietly replacing it would be worse. The delivery is kept in
+`webhook_events` either way, so you can always see what the store actually sent.
+Real changes arrive on `orders/updated` and `orders/cancelled`, which are out of
+scope here.
+
 The mock courier, in another terminal:
 
 ```bash
@@ -57,6 +97,27 @@ curl localhost:4000/health
 
 The worker and a single `docker compose up` that runs everything come in later
 steps.
+
+## Data model
+
+Three tables, created by one migration.
+
+- `webhook_events` keyed on the `X-Shop-Webhook-Id`, one row per delivery
+  including duplicates, and it keeps the payload that came with it
+- `orders` keyed on the store's order id as text, with the payload, a status of
+  `received` / `shipped` / `failed`, and the courier's shipment id once we have one
+- `jobs` is the queue. One row per order and job type, enforced by a unique key,
+  so a duplicate job cannot be inserted even if something tries
+
+Everything that touches the `jobs` table goes through `src/queue/jobs.ts`.
+Nothing else writes to it. Moving to BullMQ or SQS later should mean rewriting
+that one file, and the idempotency would still hold because it lives in the
+unique keys rather than in the queue.
+
+Two check constraints on `orders` are worth pointing out. One limits `status` to
+the three values. The other says an order cannot be `shipped` unless
+`shipment_id` is set, which is the mistake this whole service is trying not to
+make.
 
 ## Mock courier
 
